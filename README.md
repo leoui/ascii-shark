@@ -344,3 +344,9 @@ The idea of drawing a procedural 3D scene as coloured ASCII with a glow pass com
 [ascii-lab-public](https://github.com/sapozhkov/ascii-lab-public) by sapozhkov, whose
 `clownfish.py` renders a clownfish and an anemone to video. This project is a separate,
 from-scratch implementation for the browser, with its own models, behaviours and renderer.
+
+---
+
+## License
+
+[MIT](LICENSE) © 2026 leoui

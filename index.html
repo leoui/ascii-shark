@@ -1,0 +1,800 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>shark</title>
+<meta name="description" content="Sharks cruising through open water, drawn live in ASCII.">
+<meta name="theme-color" content="#06223a">
+<style>
+  html, body { margin: 0; height: 100%; background: #020a14; overflow: hidden; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #tag { position: fixed; left: 20px; bottom: 16px; font: 12px/1 Menlo, Consolas, "DejaVu Sans Mono", monospace;
+         color: #3a5a74; letter-spacing: .1em; user-select: none; pointer-events: none; }
+  body.idle { cursor: none; }
+  noscript { position: fixed; inset: 0; display: grid; place-items: center; color: #6f8fb0;
+             font: 14px Menlo, Consolas, monospace; }
+</style>
+</head>
+<body>
+<canvas id="sea" role="img" aria-label="ASCII sharks cruising through open water"></canvas>
+<div id="tag"></div>
+<noscript>~ the sharks need JavaScript to swim ~</noscript>
+<script>
+(() => {
+'use strict';
+
+// ---------------------------------------------------------------------------------------
+// ASCII sharks that never repeat. Each shark is a procedural 3D body bent by a swimming
+// wave that grows towards the tail; it steers towards places it picks at random, banks
+// into its turns, and now and then goes for a school of small fish, which scatters.
+// Every frame the scene is projected onto a grid of letters and given a soft glow.
+// ---------------------------------------------------------------------------------------
+
+const TAU = Math.PI * 2, STEP = 1 / 60, CAM_D = 6, FPS_CAP = 30;
+const FONT = 'Menlo, Consolas, "DejaVu Sans Mono", "Liberation Mono", "Courier New", monospace';
+// [chance] every choice is drawn from the browser's cryptographic source, and the waits between
+// behaviours are exponential: however long you have watched, the next one is no closer.
+const POOL = new Uint32Array(512); let poolAt = POOL.length;
+const rand = () => { if (poolAt >= POOL.length) { crypto.getRandomValues(POOL); poolAt = 0; } return POOL[poolAt++] / 4294967296; };
+const rnd = (a = 0, b = 1) => a + rand() * (b - a);
+const expo = (mean, lo, hi) => Math.min(hi, lo + -Math.log(1 - rand()) * mean);
+const chance = p => rand() < p;
+const clamp = (x, a, b) => (x < a ? a : x > b ? b : x);
+const ease = x => { x = clamp(x, 0, 1); return x * x * (3 - 2 * x); };
+const wrap = a => { a = (a + Math.PI) % TAU; if (a < 0) a += TAU; return a - Math.PI; };
+const LIGHT = (() => { const v = [-0.25, 0.92, -0.30], n = Math.hypot(...v); return v.map(x => x / n); })();
+
+const SKIN = 1, FIN = 2, GILL = 3, EYE = 4, FISH = 5, SNOW = 6, BIT = 7;
+const RAY = new Uint8Array(16); RAY[FIN] = RAY[GILL] = 1;
+const RAMP_CODES = [];
+RAMP_CODES[SKIN] = [...'.:;+*oO0#@'].map(c => c.charCodeAt(0));
+RAMP_CODES[EYE] = [...'@'].map(c => c.charCodeAt(0));
+const LINE = [...'-/|\\'].map(ch => ch.charCodeAt(0));
+const CODE = ch => ch.charCodeAt(0);
+
+const PALETTES = [
+  { top: [128, 156, 186], belly: [232, 238, 244], fin: [104, 132, 164] },    // grey reef
+  { top: [92, 120, 128], belly: [214, 226, 222], fin: [70, 98, 108] },      // blue-green
+  { top: [126, 126, 150], belly: [230, 228, 236], fin: [100, 100, 128] },    // slate
+].map(p => Object.fromEntries(Object.entries(p).map(([k, v]) => [k, v.map(x => x / 255)])));
+
+// ---- the body ----------------------------------------------------------------------------
+// [body] s runs from the snout (0) to the root of the tail (1); the body is 1 long here and
+// scaled later. The cross-section is an ellipse with a flatter belly.
+const S_PROF = [0, .03, .08, .15, .25, .35, .45, .55, .65, .75, .85, .93, 1];
+const H_PROF = [0, .035, .06, .085, .105, .112, .108, .095, .078, .058, .040, .030, .026];
+const W_PROF = [0, .04, .065, .085, .095, .095, .088, .075, .06, .045, .032, .025, .022];
+function prof(s, ys) {
+  if (s <= 0) return ys[0];
+  if (s >= 1) return ys[ys.length - 1];
+  let i = 1; while (S_PROF[i] < s) i++;
+  const f = (s - S_PROF[i - 1]) / (S_PROF[i] - S_PROF[i - 1]);
+  return ys[i - 1] + (ys[i] - ys[i - 1]) * f;
+}
+
+// ---- screen ------------------------------------------------------------------------------
+const cv = document.getElementById('sea'), ctx = cv.getContext('2d');
+const G = document.createElement('canvas'), gx = G.getContext('2d');
+const S1 = document.createElement('canvas'), s1 = S1.getContext('2d');
+const S2 = document.createElement('canvas'), s2 = S2.getContext('2d');
+let W, H, DPR, FS, CW, CH, COLS, ROWS, CELLS, SCALE, MID_Y, BX, VY;
+let chars, cr, cg, cb, zbuf, owner, bodyMask, speck;
+const CENTER_Y = 0;
+
+function layout() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  FS = clamp(Math.round(H / 72), 11, 20);
+  CH = Math.round(FS * 1.18);
+  gx.font = `${FS}px ${FONT}`;
+  CW = gx.measureText('M').width || FS * 0.6;
+  COLS = Math.ceil(W / CW); ROWS = Math.ceil(H / CH); CELLS = COLS * ROWS;
+  SCALE = Math.min(H * 0.40, W * 0.22);
+  MID_Y = H * 0.5;
+  BX = W / 2 / SCALE; VY = MID_Y / SCALE;
+  cv.width = G.width = Math.round(W * DPR); cv.height = G.height = Math.round(H * DPR);
+  S1.width = Math.ceil(W / 3); S1.height = Math.ceil(H / 3);
+  S2.width = Math.ceil(W / 9); S2.height = Math.ceil(H / 9);
+  gx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  gx.font = `${FS}px ${FONT}`; gx.textBaseline = 'top';
+  chars = new Uint8Array(CELLS); owner = new Uint8Array(CELLS); bodyMask = new Uint8Array(CELLS);
+  cr = new Float32Array(CELLS); cg = new Float32Array(CELLS); cb = new Float32Array(CELLS); zbuf = new Float32Array(CELLS);
+  speck = new Float32Array(CELLS);
+  for (let i = 0; i < CELLS; i++) { const h = Math.sin((i % COLS) * 78.233 + Math.floor(i / COLS) * 12.9898) * 43758.5453; speck[i] = h - Math.floor(h); }
+}
+
+// ---- a shark -------------------------------------------------------------------------------
+// [swimmer] nobody draws its path. It picks a place, swings its heading towards it no faster
+// than a shark can turn, banks into the turn, and beats its tail: the harder it tries, the
+// faster the beat, and every sweep pushes it on while the water holds it back. Now and then
+// the big one gets hungry and goes for the school at full speed.
+const THRUST = 0.55, DRAG = 1.5;
+
+function matMul(a, b) {
+  const m = new Array(9);
+  for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) m[r * 3 + c] = a[r * 3] * b[c] + a[r * 3 + 1] * b[3 + c] + a[r * 3 + 2] * b[6 + c];
+  return m;
+}
+
+class Shark {
+  constructor(opt) {
+    Object.assign(this, opt);
+    this.len = 2.6 * this.size;
+    this.pos = this.pickTarget();
+    this.a = rnd(0, TAU); this.th = 0; this.roll = 0; this.turn = 0;
+    this.v = 0.4 * this.size; this.e = 0.6; this.phi = rnd(0, TAU);
+    // a temperament of its own: how lazily it cruises, how readily it turns, how its tail beats
+    this.cruise = rnd(0.48, 0.78); this.eager = rnd(0.5, 0.95); this.beat = rnd(0.85, 1.15);
+    this.drift = 0; this.urge = 0;                                     // slow random wanderings of heading and effort
+    this.target = this.pickTarget(); this.bored = expo(14, 4, 45);
+    this.hunt = 0; this.nextHunt = expo(110, 30, 400);
+    this.close = 0; this.nextClose = this.hunter ? expo(80, 20, 300) : 1e9;     // [close] seconds left of a pass in front of the lens
+    this.away = 0; this.gone = 0; this.nextExit = this.hunter ? expo(75, 25, 260) : expo(45, 10, 180);   // 0 here, 1 leaving, 2 out of sight
+    this.kill = null; this.jaw = 0; this.shake = 0;                    // [feed] the rare chase
+    this.M = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+    this.pose();
+  }
+
+  pickTarget() {
+    // the other side of the view, mostly: sharks cruise past rather than come straight at you
+    const z = rnd(this.zMin, this.zMax), k = (CAM_D + z) / CAM_D;
+    const here = this.pos ? this.pos[0] - cam.target[0] : 0, r = rand();
+    // mostly across to the other side, but sometimes a loop on the same side, or a dive or a climb
+    const side = r < 0.65 ? -Math.sign(here || (chance(0.5) ? 1 : -1)) : Math.sign(here || 1);
+    const x = r < 0.88 ? cam.target[0] + side * rnd(0.25, 0.85) * BX * k : (this.pos ? this.pos[0] : 0) + rnd(-0.6, 0.6);
+    const y = r < 0.88 ? CENTER_Y + VY * k * rnd(-0.4, 0.4) : CENTER_Y + VY * k * (chance(0.5) ? rnd(-0.55, -0.3) : rnd(0.3, 0.5));
+    return [x, y, z];
+  }
+
+  pose(t = 0) {   // the body's own axes into the world: roll about its length, pitch the nose, then the heading
+    const a = this.a + (this.shake > 0 ? 0.13 * this.shake * Math.sin(t * 19) : 0);   // the head-shake after a bite
+    const ca = Math.cos(a), sa = Math.sin(a), ct = Math.cos(this.th), st = Math.sin(this.th);
+    const cr = Math.cos(this.roll), sr = Math.sin(this.roll);
+    const Ry = [ca, 0, sa, 0, 1, 0, -sa, 0, ca], Rz = [ct, -st, 0, st, ct, 0, 0, 0, 1], Rx = [1, 0, 0, 0, cr, -sr, 0, sr, cr];
+    this.M = matMul(Ry, matMul(Rz, Rx));
+  }
+
+  world(lx, ly, lz, out, o) {
+    const M = this.M, L = this.len, P = this.pos;
+    lx *= L; ly *= L; lz *= L;
+    out[o] = P[0] + M[0] * lx + M[1] * ly + M[2] * lz;
+    out[o + 1] = P[1] + M[3] * lx + M[4] * ly + M[5] * lz;
+    out[o + 2] = P[2] + M[6] * lx + M[7] * ly + M[8] * lz;
+  }
+
+  turnVec(x, y, z, out, o) {   // a direction, turned but not moved
+    const M = this.M;
+    out[o] = M[0] * x + M[1] * y + M[2] * z; out[o + 1] = M[3] * x + M[4] * y + M[5] * z; out[o + 2] = M[6] * x + M[7] * y + M[8] * z;
+  }
+
+  // [wave] the body bends sideways as a wave that runs from head to tail; the head hardly
+  // moves, the tail sweeps wide. A turn bends the whole spine into a gentle C.
+  sway(s) {
+    const amp = (0.008 + 0.075 * s ** 2.2) * (0.7 + 0.45 * this.e);
+    return amp * Math.sin(this.phi - 4.6 * s) + this.turn * 0.18 * (s - 0.3) * Math.abs(s - 0.3);
+  }
+
+  head(out) { this.world(0.45, 0, this.sway(0.05), out, 0); return out; }
+
+  edge() {   // how far from the middle of the view a shark must be to be wholly out of sight
+    return BX * (CAM_D + this.pos[2]) / CAM_D + 0.65 * this.len;
+  }
+
+  // [away] now and then a shark simply swims off, out of the picture. A while later it comes
+  // back: sometimes from where it left, as if it had turned round out there, sometimes from
+  // the other side.
+  wander(dt) {
+    const P = this.pos, off = P[0] - cam.target[0];
+    if (this.away === 0) {
+      this.nextExit -= dt;
+      if (this.nextExit < 0 && this.hunt <= 0 && this.close <= 0 && !this.kill) {
+        const side = Math.cos(this.a) >= 0 ? 1 : -1;                 // straight on, no U-turn
+        this.away = 1;
+        this.target = [cam.target[0] + side * (this.edge() + rnd(1.5, 4)), P[1] + rnd(-0.5, 0.5), P[2] + rnd(-0.6, 0.6)];
+      }
+    } else if (this.away === 1) {
+      if (Math.abs(off) > this.edge()) { this.away = 2; this.gone = expo(8, 2, 35); }
+    } else {
+      this.gone -= dt;
+      if (this.gone < 0) {
+        const r = rand();
+        if (r < 0.4) {                                                  // come in from the other side
+          P[0] = cam.target[0] - off;
+          this.a = (P[0] > cam.target[0] ? Math.PI : 0) + rnd(-0.4, 0.4);
+          this.turn = 0; this.roll = 0;
+        } else if (r < 0.6) {                                           // or rise out of the blue, far off
+          P[0] = cam.target[0] + rnd(-0.5, 0.5) * BX; P[2] = this.zMax + rnd(3, 5); P[1] = CENTER_Y + rnd(-0.6, 0.6);
+          this.a = rnd(0, TAU); this.turn = 0; this.roll = 0;
+        }                                                               // otherwise it turns back where it left
+        this.away = 0; this.nextExit = this.hunter ? expo(75, 25, 260) : expo(45, 10, 180);
+        const z = rnd(this.zMin, this.zMax), k = (CAM_D + z) / CAM_D;
+        this.target = [cam.target[0] - Math.sign(off || 1) * rnd(0.2, 0.6) * BX * k, CENTER_Y + VY * k * rnd(-0.35, 0.35), z];
+        this.bored = expo(14, 4, 45);
+      }
+    }
+  }
+
+  // [feed] the rare chase: one fish that strayed from the school is singled out. The shark aims
+  // where the fish is going, not where it is, opens its jaw as it closes in, and bites.
+  startFeed(school) {
+    const i = school.straggler();
+    if (i < 0) return false;
+    school.prey = i; school.preyTire = 0;
+    this.kill = { t: 0, effort: rnd(2.6, 3.4) };
+    this.hunt = 0; this.close = 0;
+    return true;
+  }
+
+  chase(dt, school) {
+    const K = this.kill, i = school.prey;
+    K.t += dt;
+    if (i < 0 || !school.alive[i]) { this.kill = null; this.jaw = 0; return this.target; }
+    const o = i * 3, p = school.p, v = school.v, H = this.head([0, 0, 0]);
+    const d = Math.hypot(p[o] - H[0], p[o + 1] - H[1], p[o + 2] - H[2]);
+    const lead = clamp(d / Math.max(this.v, 0.3), 0, 1.2) * rnd(0.6, 1.0);
+    this.jaw += ((d < 0.9 ? 1 : 0) - this.jaw) * 6 * dt;
+    if (d < 0.2 + 0.05 * this.size) {                                     // the bite
+      school.eat(i);
+      this.kill = null; this.jaw = 0; this.shake = rnd(0.6, 1.1);
+      this.target = this.pickTarget(); this.bored = expo(14, 6, 40);
+      this.nextHunt = expo(110, 40, 400); this.nextClose = Math.max(this.nextClose, expo(60, 20, 200));
+      return this.target;
+    }
+    return [p[o] + v[o] * lead, p[o + 1] + v[o + 1] * lead, p[o + 2] + v[o + 2] * lead];
+  }
+
+  step(dt, t, school) {
+    const P = this.pos;
+    this.wander(dt);
+    if (this.hunter && this.away === 0 && !this.kill) {
+      this.nextHunt -= dt;
+      if (this.hunt <= 0 && this.close <= 0 && this.nextHunt < 0) { this.hunt = rnd(4, 10); }
+    }
+    // [close] and now and then it comes to have a look at you: it swims right up to the lens,
+    // so near that it fills the picture, then sweeps past and away
+    if (this.hunter && this.away === 0 && this.hunt <= 0 && !this.kill) {
+      if (this.close <= 0) {
+        this.nextClose -= dt;
+        if (this.nextClose < 0) {
+          this.close = rnd(15, 22); this.closeTo = rnd(1.9, 2.9);
+          this.target = [cam.target[0] + rnd(-0.9, 0.9), CENTER_Y + rnd(-0.4, 0.4), cam.target[2] - CAM_D + rnd(1.5, 2.4)];
+        }
+      } else {
+        this.close -= dt;
+        const lens = camDepth(P);
+        if (lens < this.closeTo || this.close <= 0) {                                   // close enough: veer off and go back out
+          this.close = 0; this.nextClose = expo(90, 25, 320);
+          const side = chance(0.5) ? -1 : 1, z = rnd(this.zMin, this.zMax), k = (CAM_D + z) / CAM_D;
+          this.target = [cam.target[0] + side * rnd(0.5, 0.8) * BX * k, CENTER_Y + VY * k * rnd(-0.3, 0.3), z];
+          this.bored = expo(14, 4, 45);
+        }
+      }
+    }
+    let T = this.target;
+    if (this.kill) T = this.chase(dt, school);
+    if (this.hunt > 0 && !this.kill) {
+      this.hunt -= dt; T = school.centre;
+      const hd = Math.hypot(T[0] - P[0], T[1] - P[1], T[2] - P[2]);
+      if (hd < 0.6 || this.hunt <= 0) { this.hunt = 0; this.nextHunt = expo(110, 30, 400); this.target = this.pickTarget(); }
+    }
+    const dx = T[0] - P[0], dy = T[1] - P[1], dz = T[2] - P[2], dist = Math.hypot(dx, dy, dz) || 1e-6;
+    this.bored -= dt;
+    if (this.away === 0 && this.hunt <= 0 && this.close <= 0 && !this.kill && (dist < 0.5 + 0.5 * this.size || this.bored < 0)) { this.target = this.pickTarget(); this.bored = expo(14, 4, 45); }
+    // the slow wanderings: a heading that strays and an effort that swells and fades, never in step
+    this.drift += (-this.drift * 0.25 + rnd(-1, 1) * 0.9) * dt;
+    this.urge += (-this.urge * 0.15 + rnd(-1, 1) * 0.5) * dt;
+
+    const swing = wrap(Math.atan2(-dz, dx) - this.a + (this.kill ? 0 : 0.25 * this.drift));
+    const maxTurn = (0.18 + 0.55 * this.v / this.size) * (this.kill ? 1.9 : 1);   // a shark that is barely moving cannot turn hard
+    const rate = clamp(swing * this.eager * (this.kill ? 1.8 : 1), -maxTurn, maxTurn);
+    this.a += rate * dt;
+    this.turn += (rate - this.turn) * 2.0 * dt;
+    this.th += (clamp(Math.asin(clamp(dy / dist, -1, 1)) * 0.8, -0.3, 0.3) - this.th) * 0.6 * dt;
+    this.roll += (clamp(this.turn * 0.9, -0.5, 0.5) - this.roll) * 1.5 * dt;     // it leans into the turn
+
+    const want = this.kill ? this.kill.effort : this.hunt > 0 ? 2.0 : this.close > 0 ? 1.15
+      : clamp(this.cruise * (0.8 + 0.2 * Math.max(Math.cos(swing), 0)) + 0.18 * this.urge, 0.35, 1.1);
+    this.e += (want - this.e) * (want > this.e ? 1.6 : 0.5) * dt;      // a burst comes on fast and fades slowly
+    this.phi += TAU * (0.45 + 0.7 * this.e) * this.beat * dt;
+    const s2 = Math.sin(this.phi) ** 2;
+    const push = THRUST * this.size * this.size * this.e * (0.55 + 0.45 * s2);
+    this.v += (push - DRAG * this.v * Math.abs(this.v) / this.size - 0.05 * this.v) * dt;
+    const ct = Math.cos(this.th);
+    P[0] += Math.cos(this.a) * ct * this.v * dt; P[1] += Math.sin(this.th) * this.v * dt; P[2] += -Math.sin(this.a) * ct * this.v * dt;
+    this.shake = Math.max(0, this.shake - dt);
+    this.pose(t);
+  }
+}
+
+// ---- the school --------------------------------------------------------------------------
+// [school] small fish that keep close, match each other's heading and keep a little room,
+// follow a slowly wandering home, and flee from any shark's snout that comes near.
+class School {
+  constructor(n) {
+    this.n = n; this.p = new Float32Array(n * 3); this.v = new Float32Array(n * 3);
+    this.home = [rnd(-1, 1), rnd(-0.6, 0.6), rnd(0.5, 2.5)]; this.goal = this.home.slice(); this.centre = this.home.slice();
+    this.wander = 0;
+    for (let i = 0; i < n; i++) for (let d = 0; d < 3; d++) { this.p[i * 3 + d] = this.home[d] + rnd(-0.4, 0.4); this.v[i * 3 + d] = rnd(-0.2, 0.2); }
+    this.v.forEach((_, i) => { if (i % 3 === 0) this.v[i] += 0.3; });
+    this.panic = 0;
+    this.alive = new Uint8Array(n).fill(1); this.respawn = new Float32Array(n);
+    this.prey = -1; this.preyTire = 0; this.jink = 0; this.jinkDir = [0, 0, 0];
+  }
+
+  straggler() {   // the fish furthest from the middle of the school
+    let best = -1, far = -1;
+    for (let i = 0; i < this.n; i++) {
+      if (!this.alive[i]) continue;
+      const o = i * 3, d = Math.hypot(this.p[o] - this.centre[0], this.p[o + 1] - this.centre[1], this.p[o + 2] - this.centre[2]);
+      if (d > far) { far = d; best = i; }
+    }
+    return best;
+  }
+
+  eat(i) {
+    const o = i * 3;
+    this.alive[i] = 0; this.prey = -1; this.respawn[i] = expo(25, 12, 70); this.panic = 1;
+    burst(this.p[o], this.p[o + 1], this.p[o + 2]);
+  }
+
+  step(dt, sharks) {
+    this.wander -= dt;
+    if (this.wander < 0) {
+      const z = rnd(0.3, 2.6), k = (CAM_D + z) / CAM_D;
+      this.goal = [rnd(-0.6, 0.6) * BX * k, CENTER_Y + VY * k * rnd(-0.45, 0.4), z]; this.wander = rnd(10, 22);
+    }
+    for (let d = 0; d < 3; d++) this.home[d] += (this.goal[d] - this.home[d]) * 0.12 * dt;
+    const heads = sharks.map(s => s.head([0, 0, 0]));
+    const { p, v, n } = this;
+    let cx = 0, cy = 0, cz = 0, fright = 0;
+    let live = 0;
+    for (let i = 0; i < n; i++) {
+      if (!this.alive[i]) {                                            // a newcomer joins from the edge of the view, a while later
+        this.respawn[i] -= dt;
+        if (this.respawn[i] < 0) {
+          const o = i * 3, side = chance(0.5) ? -1 : 1, k = (CAM_D + this.home[2]) / CAM_D;
+          p[o] = cam.target[0] + side * (BX * k + 0.3); p[o + 1] = this.home[1] + rnd(-0.4, 0.4); p[o + 2] = this.home[2] + rnd(-0.3, 0.3);
+          v[o] = -side * 0.6; v[o + 1] = 0; v[o + 2] = 0; this.alive[i] = 1;
+        }
+        continue;
+      }
+      cx += p[i * 3]; cy += p[i * 3 + 1]; cz += p[i * 3 + 2]; live++;
+    }
+    live = Math.max(live, 1);
+    this.centre = [cx / live, cy / live, cz / live];
+    if (this.prey >= 0) { this.preyTire += dt; this.jink -= dt; }
+    for (let i = 0; i < n; i++) {
+      if (!this.alive[i]) continue;
+      const o = i * 3, px = p[o], py = p[o + 1], pz = p[o + 2];
+      if (i === this.prey) { this.flight(i, dt, heads[0]); continue; }
+      let ax = 0, ay = 0, az = 0, mx = 0, my = 0, mz = 0, nx = 0, ny = 0, nz = 0, count = 0;
+      for (let j = 0; j < n; j++) {
+        if (j === i || !this.alive[j] || j === this.prey) continue;
+        const q = j * 3, dx = p[q] - px, dy = p[q + 1] - py, dz = p[q + 2] - pz, d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 > 0.30) continue;
+        count++; mx += v[q]; my += v[q + 1]; mz += v[q + 2]; nx += dx; ny += dy; nz += dz;
+        if (d2 < 0.035) { const k = 0.03 / (d2 + 1e-4); ax -= dx * k; ay -= dy * k; az -= dz * k; }   // room
+      }
+      if (count) {
+        ax += (mx / count - v[o]) * 1.2 + nx / count * 0.9;            // heading, and closeness
+        ay += (my / count - v[o + 1]) * 1.2 + ny / count * 0.9;
+        az += (mz / count - v[o + 2]) * 1.2 + nz / count * 0.9;
+      }
+      ax += (this.home[0] - px) * 0.35; ay += (this.home[1] - py) * 0.35; az += (this.home[2] - pz) * 0.35;
+      let flee = 0;
+      for (const h of heads) {
+        const dx = px - h[0], dy = py - h[1], dz = pz - h[2], d = Math.hypot(dx, dy, dz) || 1e-6;
+        if (d < 1.6) { const k = 5.5 * (1 - d / 1.6) / d; ax += dx * k; ay += dy * k; az += dz * k; flee = Math.max(flee, 1 - d / 1.6); }
+      }
+      fright = Math.max(fright, flee);
+      v[o] += ax * dt; v[o + 1] += ay * dt * 0.7; v[o + 2] += az * dt;
+      const sp = Math.hypot(v[o], v[o + 1], v[o + 2]) || 1e-6, top = 0.8 + 1.6 * flee, low = 0.25;
+      const k = sp > top ? top / sp : sp < low ? low / sp : 1;
+      v[o] *= k; v[o + 1] *= k; v[o + 2] *= k;
+      p[o] += v[o] * dt; p[o + 1] += v[o + 1] * dt; p[o + 2] += v[o + 2] * dt;
+    }
+    this.panic = Math.max(fright, this.panic - dt * 0.5);
+  }
+
+  // the singled-out fish runs for its life: straight away from the snout, with sudden jinks
+  // to the side, but it tires, and a shark does not
+  flight(i, dt, H) {
+    const { p, v } = this, o = i * 3;
+    const dx = p[o] - H[0], dy = p[o + 1] - H[1], dz = p[o + 2] - H[2], d = Math.hypot(dx, dy, dz) || 1e-6;
+    if (this.jink <= 0) {
+      this.jink = rnd(0.35, 1.1);
+      const a = rnd(0, TAU); this.jinkDir = [Math.cos(a), rnd(-0.6, 0.6), Math.sin(a)];
+    }
+    const pull = d < 1.4 ? 4.5 : 1.5, j = 2.6;
+    v[o] += (dx / d * pull + this.jinkDir[0] * j) * dt;
+    v[o + 1] += (dy / d * pull + this.jinkDir[1] * j) * dt * 0.7;
+    v[o + 2] += (dz / d * pull + this.jinkDir[2] * j) * dt;
+    const top = Math.max(0.2, 1.25 - 0.09 * this.preyTire), sp = Math.hypot(v[o], v[o + 1], v[o + 2]) || 1e-6;
+    if (sp > top) { v[o] *= top / sp; v[o + 1] *= top / sp; v[o + 2] *= top / sp; }
+    p[o] += v[o] * dt; p[o + 1] += v[o + 1] * dt; p[o + 2] += v[o + 2] * dt;
+    // it may not hide outside the picture
+    const k = (CAM_D + p[o + 2]) / CAM_D, lim = 0.85 * BX * k;
+    if (Math.abs(p[o] - cam.target[0]) > lim) v[o] -= Math.sign(p[o] - cam.target[0]) * 3 * dt;
+    if (Math.abs(p[o + 1] - CENTER_Y) > 0.8 * VY * k) v[o + 1] -= Math.sign(p[o + 1] - CENTER_Y) * 3 * dt;
+    if (p[o + 2] < -2.5) v[o + 2] += 3 * dt;
+  }
+}
+
+// ---- what is left after a bite ------------------------------------------------------------
+// scales that glint and sink, a faint dark cloud that spreads and fades, a few bubbles
+const bits = [];
+function burst(x, y, z) {
+  for (let k = 0; k < 18; k++) {
+    const a = rnd(0, TAU), b = rnd(-1, 1), sp = rnd(0.2, 0.7);
+    bits.push({ p: [x, y, z], v: [Math.cos(a) * sp, b * sp, Math.sin(a) * sp], age: 0, life: rnd(1.8, 3.5), ch: chance(0.5) ? '*' : chance(0.5) ? ',' : '.', col: [0.85, 0.92, 1.0], sink: -0.12, drag: 1.6 });
+  }
+  for (let k = 0; k < 14; k++) {
+    const a = rnd(0, TAU), sp = rnd(0.05, 0.25);
+    bits.push({ p: [x + rnd(-0.05, 0.05), y + rnd(-0.05, 0.05), z], v: [Math.cos(a) * sp, rnd(-0.1, 0.1), Math.sin(a) * sp], age: 0, life: rnd(3, 5.5), ch: chance(0.5) ? '~' : ':', col: [0.42, 0.07, 0.10], sink: -0.02, drag: 0.8 });
+  }
+  for (let k = 0; k < 8; k++) {
+    bits.push({ p: [x + rnd(-0.08, 0.08), y, z + rnd(-0.08, 0.08)], v: [rnd(-0.05, 0.05), rnd(0.25, 0.5), rnd(-0.05, 0.05)], age: rnd(-0.4, 0), life: rnd(2.5, 4), ch: chance(0.6) ? 'o' : 'O', col: [0.55, 0.78, 0.95], sink: 0.15, drag: 0.4 });
+  }
+}
+function stepBits(dt) {
+  for (let i = bits.length - 1; i >= 0; i--) {
+    const b = bits[i];
+    b.age += dt;
+    if (b.age > b.life) { bits.splice(i, 1); continue; }
+    if (b.age < 0) continue;
+    for (let d = 0; d < 3; d++) b.v[d] -= b.v[d] * b.drag * dt;
+    b.v[1] += b.sink * dt;
+    for (let d = 0; d < 3; d++) b.p[d] += b.v[d] * dt;
+  }
+}
+function gatherBits() {
+  for (const b of bits) {
+    if (b.age < 0) continue;
+    const f = 1 - b.age / b.life, k = f * (b.ch === '*' ? 0.6 + 0.4 * Math.sin(b.age * 23) ** 2 : 1);
+    put(b.p[0], b.p[1], b.p[2], b.p[0], b.p[1], b.p[2], b.col[0] * k, b.col[1] * k, b.col[2] * k, b.ch.charCodeAt(0), BIT, -0.05);
+  }
+}
+
+// ---- the rare feed: at most six in any 24 hours ----------------------------------------------
+// The count is kept in this browser's storage, so reloading the page does not reset it.
+const DAY = 864e5, MAX_FEEDS = 6, LOG_KEY = 'ascii-shark-feeds', NEXT_KEY = 'ascii-shark-next-feed';
+const store = { get: k => { try { return localStorage.getItem(k); } catch { return null; } }, set: (k, v) => { try { localStorage.setItem(k, v); } catch {} } };
+function feedsToday() { try { return JSON.parse(store.get(LOG_KEY) || '[]').filter(t => Date.now() - t < DAY); } catch { return []; } }
+function planFeed() { const at = Date.now() + expo(3.2, 1.0, 9) * 3600e3; store.set(NEXT_KEY, String(at)); return at; }
+let nextFeed = +store.get(NEXT_KEY) || 0;
+if (!nextFeed || nextFeed < Date.now() - DAY) nextFeed = planFeed();
+let feedCheck = 0;
+function maybeFeed(dt, hero, school, force) {
+  feedCheck -= dt;
+  if (!force && (feedCheck > 0 || Date.now() < nextFeed)) return;
+  feedCheck = 3;
+  if (hero.kill || hero.away || hero.close > 0 || hero.hunt > 0) return;    // wait until it is in view and free
+  const log = feedsToday();
+  if (log.length >= MAX_FEEDS) { nextFeed = Math.max(planFeed(), log[0] + DAY); store.set(NEXT_KEY, String(nextFeed)); return; }
+  if (hero.startFeed(school)) { log.push(Date.now()); store.set(LOG_KEY, JSON.stringify(log)); nextFeed = planFeed(); }
+}
+
+// ---- points --------------------------------------------------------------------------------
+let CAP = 0, N = 0;
+let PX, PY, PZ, QX, QY, QZ, PR, PG, PB, PL, PBIAS, PK;
+function grow(n) {
+  const c = Math.max(n, CAP * 2, 1 << 16);
+  const f = a => { const b = new Float32Array(c); if (a) b.set(a); return b; };
+  PX = f(PX); PY = f(PY); PZ = f(PZ); QX = f(QX); QY = f(QY); QZ = f(QZ);
+  PR = f(PR); PG = f(PG); PB = f(PB); PL = f(PL); PBIAS = f(PBIAS);
+  const k = new Uint8Array(c); if (PK) k.set(PK); PK = k; CAP = c;
+}
+function put(x, y, z, qx, qy, qz, r, g, b, l, kind, bias) {
+  if (N >= CAP) grow(N + 1);
+  PX[N] = x; PY[N] = y; PZ[N] = z; QX[N] = qx; QY[N] = qy; QZ[N] = qz;
+  PR[N] = r; PG[N] = g; PB[N] = b; PL[N] = l; PK[N] = kind; PBIAS[N] = bias; N++;
+}
+
+const LOC = new Float32Array(400 * 190 * 3), WP = new Float32Array(6);
+
+function gatherShark(S, t) {
+  const pal = S.pal, L = S.len;
+  const zc = camDepth(S.pos);
+  const rf = clamp(S.size * CAM_D / zc * (SCALE / 180), 0.3, 2.6);   // up close it needs many more   // fewer points for a shark that looks small
+  const ns = Math.round(150 * rf), nt = Math.round(72 * rf);
+
+  // the skin: grey above, white below, with a wavy line between; lit from the surface
+  for (let i = 0; i < ns; i++) {
+    const s = i / (ns - 1), h = prof(s, H_PROF), w = prof(s, W_PROF), sw = S.sway(s);
+    for (let k = 0; k < nt; k++) {
+      const th = TAU * k / nt, sv = Math.sin(th), o = (i * nt + k) * 3;
+      LOC[o] = 0.5 - s; LOC[o + 1] = h * sv * (sv < 0 ? 0.85 : 1) - (S.jaw > 0 && s < 0.17 && sv < 0 ? S.jaw * 0.05 * (1 - s / 0.17) * -sv : 0);
+      LOC[o + 2] = w * Math.cos(th) + sw;
+    }
+  }
+  for (let i = 0; i < ns; i++) {
+    const s = i / (ns - 1), ip = Math.min(i + 1, ns - 1), im = Math.max(i - 1, 0);
+    const edge = -0.22 + 0.08 * Math.sin(s * 26) + 0.05 * Math.sin(s * 61);
+    for (let k = 0; k < nt; k++) {
+      const o = (i * nt + k) * 3, op = (ip * nt + k) * 3, om = (im * nt + k) * 3;
+      const kp = (i * nt + (k + 1) % nt) * 3, km = (i * nt + (k - 1 + nt) % nt) * 3;
+      const ux = LOC[op] - LOC[om], uy = LOC[op + 1] - LOC[om + 1], uz = LOC[op + 2] - LOC[om + 2];
+      const fx = LOC[kp] - LOC[km], fy = LOC[kp + 1] - LOC[km + 1], fz = LOC[kp + 2] - LOC[km + 2];
+      let nx = fy * uz - fz * uy, ny = fz * ux - fx * uz, nz = fx * uy - fy * ux;      // outward: round the body, then along it
+      const nl = Math.hypot(nx, ny, nz) || 1; nx /= nl; ny /= nl; nz /= nl;
+      S.turnVec(nx, ny, nz, WP, 3);
+      const lit = Math.max(WP[3] * LIGHT[0] + WP[4] * LIGHT[1] + WP[5] * LIGHT[2], 0);
+      const sv = Math.sin(TAU * k / nt), belly = ease((edge - sv) / 0.16 + 0.5);
+      const shade = 0.28 + 0.72 * lit, spec = 0.28 * lit ** 14 * (1 - belly);
+      const tail = 1 - 0.25 * ease((s - 0.6) / 0.4) * (1 - belly);
+      const m = shade * tail;
+      S.world(LOC[o], LOC[o + 1], LOC[o + 2], WP, 0);
+      put(WP[0], WP[1], WP[2], WP[0], WP[1], WP[2],
+          (pal.top[0] * (1 - belly) + pal.belly[0] * belly) * m + spec, (pal.top[1] * (1 - belly) + pal.belly[1] * belly) * m + spec,
+          (pal.top[2] * (1 - belly) + pal.belly[2] * belly) * m + spec, clamp(0.18 + 0.9 * m * (0.78 + 0.3 * belly), 0, 1), SKIN, 0);
+    }
+  }
+
+  // gill slits, the mouth and the eyes: marks on the skin, nudged just outside it
+  const mark = (s, th, ds, dth, out) => {
+    const h = prof(s, H_PROF) * 1.04, w = prof(s, W_PROF) * 1.04, sv = Math.sin(th);
+    const y = h * sv * (sv < 0 ? 0.85 : 1), z = w * Math.cos(th) + S.sway(s);
+    const s2 = s + ds, th2 = th + dth, h2 = prof(s2, H_PROF) * 1.04, w2 = prof(s2, W_PROF) * 1.04, sv2 = Math.sin(th2);
+    S.world(0.5 - s, y, z, out, 0);
+    S.world(0.5 - s2, h2 * sv2 * (sv2 < 0 ? 0.85 : 1), w2 * Math.cos(th2) + S.sway(s2), out, 3);
+  };
+  const steps = Math.max(6, Math.round(14 * rf));
+  for (const side of [0, Math.PI]) {
+    for (let g = 0; g < 5; g++) for (let j = 0; j < steps; j++) {
+      const th = side + (side ? 1 : -1) * (-0.55 + 0.9 * j / (steps - 1)) * (side ? -1 : 1);
+      mark(0.20 + 0.022 * g + 0.004 * j / steps, th, 0, 0.08, WP);
+      put(WP[0], WP[1], WP[2], WP[3], WP[4], WP[5], 0.16, 0.20, 0.25, 0.5, GILL, -0.01 * L);
+    }
+    const eye = side ? Math.PI - 0.32 : 0.32;
+    mark(0.085, eye, 0, 0, WP);
+    put(WP[0], WP[1], WP[2], WP[0], WP[1], WP[2], 0.05, 0.06, 0.08, 1, EYE, -0.02 * L);
+  }
+  for (let j = 0; j < steps * 2; j++) {   // the mouth: a curve under the snout, from one side to the other
+    const f = j / (steps * 2 - 1), th = -Math.PI / 2 + (f - 0.5) * 2.0, s = 0.12 - 0.05 * Math.cos((f - 0.5) * Math.PI);
+    mark(s, th, 0, 0.1, WP);
+    put(WP[0], WP[1], WP[2], WP[3], WP[4], WP[5], 0.20, 0.22, 0.27, 0.5, GILL, -0.01 * L);
+  }
+
+  // fins: flat sheets drawn as strokes that run from the root to the tip
+  const sx = x => S.sway(0.5 - x);
+  const s1 = S.sway(1), slope = (S.sway(1) - S.sway(0.95)) / 0.05;
+  const zAt = x => (x >= -0.5 ? sx(x) : s1 + (-0.5 - x) * slope * 0.9);      // the tail is a stiff blade beyond its root
+  const fin = (r0, r1, tip, na, nb, dark) => {
+    na = Math.max(4, Math.round(na * rf)); nb = Math.max(3, Math.round(nb * rf));
+    for (let a = 0; a < na; a++) {
+      const fa = a / (na - 1);
+      const rx = r0[0] + (r1[0] - r0[0]) * fa, ry = r0[1] + (r1[1] - r0[1]) * fa, rz = r0[2] + (r1[2] - r0[2]) * fa;
+      for (let b = 0; b < nb; b++) {
+        const fb = b / (nb - 1) * (1 - 0.25 * Math.sin(Math.PI * fa) * 0);
+        const x = rx + (tip[0] - rx) * fb, y = ry + (tip[1] - ry) * fb, z = rz + (tip[2] - rz) * fb;
+        const x2 = rx + (tip[0] - rx) * (fb + 0.05), y2 = ry + (tip[1] - ry) * (fb + 0.05), z2 = rz + (tip[2] - rz) * (fb + 0.05);
+        S.world(x, y, z + zAt(x), WP, 0); S.world(x2, y2, z2 + zAt(x2), WP, 3);
+        const lit = 0.55 + 0.35 * (1 - fb) - 0.25 * dark * fb;
+        put(WP[0], WP[1], WP[2], WP[3], WP[4], WP[5], pal.fin[0] * lit, pal.fin[1] * lit, pal.fin[2] * lit, 0.6, FIN, 0);
+      }
+    }
+  };
+  const top = s => prof(s, H_PROF) * 0.92, flap = 0.02 * Math.sin(0.7 * t + S.phi * 0.1);
+  fin([0.5 - 0.34, top(0.34), 0], [0.5 - 0.50, top(0.50), 0], [0.5 - 0.47, top(0.42) + 0.165, 0], 40, 24, 1);      // first dorsal
+  fin([0.5 - 0.79, top(0.79), 0], [0.5 - 0.85, top(0.85), 0], [0.5 - 0.865, top(0.82) + 0.045, 0], 12, 8, 1);      // second dorsal
+  for (const side of [-1, 1]) {
+    const y0 = -prof(0.27, H_PROF) * 0.45, z0 = side * prof(0.27, W_PROF) * 0.8;
+    fin([0.5 - 0.23, y0, z0], [0.5 - 0.32, y0, z0], [0.5 - 0.43, -0.105 + flap, side * 0.30], 36, 26, 1);         // pectorals
+    const y1 = -prof(0.64, H_PROF) * 0.8, z1 = side * prof(0.64, W_PROF) * 0.5;
+    fin([0.5 - 0.62, y1, z1], [0.5 - 0.67, y1, z1], [0.5 - 0.72, y1 - 0.05, side * 0.07], 10, 8, 0);              // pelvics
+  }
+  fin([0.5 - 0.80, -top(0.80), 0], [0.5 - 0.85, -top(0.85), 0], [0.5 - 0.875, -top(0.82) - 0.04, 0], 10, 7, 0);    // anal
+  fin([-0.49, -0.022, 0], [-0.49, 0.026, 0], [-0.73, 0.215, 0], 14, 44, 1);                                         // tail, upper lobe
+  fin([-0.49, -0.022, 0], [-0.49, 0.020, 0], [-0.61, -0.125, 0], 12, 28, 1);                                        // tail, lower lobe
+}
+
+// ---- the water around ----------------------------------------------------------------------
+let SNOW_P = null, SNOW_PH = null;
+function makeSnow() {
+  const n = Math.round(clamp(W * H / 2600, 300, 1400));
+  SNOW_P = new Float32Array(n * 3); SNOW_PH = new Float32Array(n);
+  for (let i = 0; i < n; i++) { SNOW_P[i * 3] = rnd(-9, 9); SNOW_P[i * 3 + 1] = rnd(-5, 5); SNOW_P[i * 3 + 2] = rnd(-3, 10); SNOW_PH[i] = rnd(0, TAU); }
+}
+function gatherSnow(t, dt) {
+  const T = cam.target, n = SNOW_PH.length;
+  for (let i = 0; i < n; i++) {
+    const o = i * 3;
+    SNOW_P[o + 1] -= 0.02 * dt * (0.5 + SNOW_PH[i] / TAU);
+    if (SNOW_P[o] < T[0] - 9) SNOW_P[o] += 18; else if (SNOW_P[o] > T[0] + 9) SNOW_P[o] -= 18;
+    if (SNOW_P[o + 1] < T[1] - 5) SNOW_P[o + 1] += 10; else if (SNOW_P[o + 1] > T[1] + 5) SNOW_P[o + 1] -= 10;
+    const x = SNOW_P[o] + 0.10 * Math.sin(0.3 * t + SNOW_PH[i]), y = SNOW_P[o + 1] + 0.12 * Math.sin(0.21 * t + 1.7 * SNOW_PH[i]), z = SNOW_P[o + 2];
+    put(x, y, z, x, y, z, 90 / 255, 135 / 255, 170 / 255, SNOW_PH[i], SNOW, 0);
+  }
+}
+function gatherSchool(sc, t) {
+  const { p, v, n } = sc;
+  for (let i = 0; i < n; i++) {
+    if (!sc.alive[i]) continue;
+    const o = i * 3, glint = 0.55 + 0.45 * Math.sin(t * 3.1 + i * 1.7) ** 2 + 0.4 * sc.panic + (i === sc.prey ? 0.5 : 0);
+    put(p[o], p[o + 1], p[o + 2], p[o] + v[o] * 0.3, p[o + 1] + v[o + 1] * 0.3, p[o + 2] + v[o + 2] * 0.3,
+        0.62 * glint, 0.74 * glint, 0.84 * glint, 1, FISH, 0);
+  }
+}
+
+// ---- camera ------------------------------------------------------------------------------
+const cam = { target: [0, CENTER_Y, 0], yaw: 0, pitch: 0, cy: 1, sy: 0, cp: 1, sp: 0 };
+function updateCamera(t, dt, hero) {
+  // the camera keeps the big shark in view, but does not chase it out of the picture:
+  // while it is away, the camera drifts over to the school and waits
+  const c = hero.away === 0 ? hero.pos : school ? school.centre : [0, CENTER_Y, 0], w = hero.away === 0 ? (hero.close > 0 ? 0.25 : 0.6) : 0.35;
+  const want = [c[0] * w, CENTER_Y + (c[1] - CENTER_Y) * 0.45, hero.close > 0 ? cam.target[2] : c[2] * 0.3], k = Math.min(1, dt * (hero.away === 0 ? 0.3 : 0.12));
+  for (let d = 0; d < 3; d++) cam.target[d] += (want[d] - cam.target[d]) * k;
+  cam.yaw = 0.28 * Math.sin(t * 0.029) + 0.16 * Math.sin(t * 0.0117 + 1);
+  cam.pitch = -0.05 + 0.08 * Math.sin(t * 0.021 + 2);
+  cam.cy = Math.cos(cam.yaw); cam.sy = Math.sin(cam.yaw); cam.cp = Math.cos(cam.pitch); cam.sp = Math.sin(cam.pitch);
+}
+function camDepth(p) {
+  const dx = p[0] - cam.target[0], dy = p[1] - cam.target[1], dz = p[2] - cam.target[2];
+  return cam.sp * dy + cam.cp * (-cam.sy * dx + cam.cy * dz) + CAM_D;
+}
+
+// ---- from points to letters ----------------------------------------------------------------
+const lineGlyph = (dx, dy) => {
+  let a = Math.atan2(-dy / CH, dx / CW); if (a < 0) a += Math.PI;
+  return LINE[Math.floor((a + Math.PI / 8) / (Math.PI / 4)) % 4];
+};
+const C_PLUS = CODE('+'), C_DOT = CODE('.'), C_TICK = CODE("'"), C_DUST = CODE(':'), C_WAVE = CODE('~');
+const C_R = CODE('>'), C_L = CODE('<'), C_UP = CODE('^'), C_DN = CODE('v');
+
+function project() {
+  zbuf.fill(1e9); chars.fill(0); owner.fill(0);
+  const { cy, sy, cp, sp } = cam, T = cam.target, f0 = SCALE * CAM_D, cx0 = W / 2;
+  for (let i = 0; i < N; i++) {
+    let dx = PX[i] - T[0], dy = PY[i] - T[1], dz = PZ[i] - T[2];
+    const x1 = cy * dx + sy * dz, z1 = -sy * dx + cy * dz;
+    const y2 = cp * dy - sp * z1, z2 = sp * dy + cp * z1 + CAM_D;
+    if (z2 < 0.4) continue;
+    const f = f0 / z2, sx = cx0 + f * x1, syy = MID_Y - f * y2;
+    const col = Math.floor(sx / CW), row = Math.floor(syy / CH);
+    if (col < 0 || col >= COLS || row < 0 || row >= ROWS) continue;
+    const cell = row * COLS + col, key = z2 + PBIAS[i];
+    if (key >= zbuf[cell]) continue;
+    const kind = PK[i];
+    let ch;
+    if (RAY[kind] || kind === FISH) {
+      dx = QX[i] - T[0]; dy = QY[i] - T[1]; dz = QZ[i] - T[2];
+      const qx1 = cy * dx + sy * dz, qz1 = -sy * dx + cy * dz;
+      const qy2 = cp * dy - sp * qz1, qz2 = Math.max(sp * dy + cp * qz1 + CAM_D, 0.4), qf = f0 / qz2;
+      const ddx = qf * qx1 - f * x1, ddy = (MID_Y - qf * qy2) - syy;
+      if (kind === FISH) ch = Math.abs(ddy) > 2.2 * Math.abs(ddx) ? (ddy < 0 ? C_UP : C_DN) : ddx > 0 ? C_R : C_L;
+      else ch = lineGlyph(ddx, ddy);
+    } else if (kind === BIT) {
+      ch = PL[i];
+    } else if (kind === SNOW) {
+      ch = z2 < 4.5 ? C_PLUS : PL[i] > 5.0 ? C_TICK : C_DOT;
+    } else {
+      const r = RAMP_CODES[kind];
+      ch = r[Math.min(r.length - 1, Math.floor(PL[i] * r.length))];
+    }
+    let fog = clamp(1.4 - 0.08 * z2, 0.2, 1);
+    if (kind === SNOW) fog *= clamp(1.4 - 0.13 * z2, 0.2, 1);
+    zbuf[cell] = key; chars[cell] = ch; owner[cell] = kind;
+    cr[cell] = PR[i] * fog; cg[cell] = PG[i] * fog; cb[cell] = PB[i] * fog;
+  }
+}
+
+function outline() {
+  // where a shark's body meets open water, trace its silhouette with a stroke along it
+  for (let i = 0; i < CELLS; i++) { const o = owner[i]; bodyMask[i] = o === SKIN || o === GILL || o === EYE ? 1 : 0; }
+  const at = (r, c) => (r < 0 || r >= ROWS || c < 0 || c >= COLS ? 0 : bodyMask[r * COLS + c]);
+  const open = (r, c) => { if (r < 0 || r >= ROWS || c < 0 || c >= COLS) return true; const o = owner[r * COLS + c]; return o === 0 || o === SNOW || o === FISH || o === BIT; };
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    const i = r * COLS + c;
+    if (owner[i] !== SKIN) continue;
+    if (!(open(r - 1, c) || open(r + 1, c) || open(r, c - 1) || open(r, c + 1))) continue;
+    const gxv = at(r, c + 1) - at(r, c - 1), gyv = at(r + 1, c) - at(r - 1, c);
+    if (!gxv && !gyv) continue;
+    chars[i] = lineGlyph(-gyv / CH * CW, gxv / CW * CH);
+    cr[i] = Math.min(cr[i] * 1.05 + 0.06, 1); cg[i] = Math.min(cg[i] * 1.05 + 0.08, 1); cb[i] = Math.min(cb[i] * 1.05 + 0.10, 1);
+  }
+}
+
+function sunlight(t) {
+  // beams from the surface sway in a fan; under the surface the light ripples
+  const srcX = W / 2 - 0.65 * W * cam.yaw, srcY = -0.8 * H;
+  const beams = [];
+  for (let k = 0; k < 8; k++) beams.push([-0.40 + 0.114 * k + 0.03 * Math.sin(t * (0.06 + 0.011 * k) + 1.9 * k),
+    0.55 + 0.45 * Math.sin(t * (0.1 + 0.017 * k) + 1.3 * k), 0.024 + 0.012 * (k % 2)]);
+  for (let r = 0; r < ROWS; r++) {
+    const y = (r + 0.5) * CH, fade = Math.exp(-y / (H * 0.6));
+    for (let c = 0; c < COLS; c++) {
+      const i = r * COLS + c, a = Math.atan2((c + 0.5) * CW - srcX, y - srcY);
+      let lit = 0;
+      for (const [a0, k, w] of beams) { const d = (a - a0) / w; if (d > -4 && d < 4) lit += k * Math.exp(-d * d); }
+      lit *= fade;
+      if (chars[i]) { const m = 1 + 0.45 * lit; cr[i] = Math.min(cr[i] * m, 1); cg[i] = Math.min(cg[i] * m, 1); cb[i] = Math.min(cb[i] * m, 1); }
+      else if (r < 3) {
+        const wave = Math.sin(c * 0.33 + t * 1.1 + r * 1.7) * Math.sin(c * 0.11 - t * 0.6 + r);
+        if (wave > 0.45) { const k = (wave - 0.45) * (1 - r / 3) * 1.4; chars[i] = C_WAVE; cr[i] = 0.30 * k; cg[i] = 0.55 * k; cb[i] = 0.72 * k; }
+      } else if (lit > 0.32 && speck[i] > 0.93) { chars[i] = C_DUST; cr[i] = 50 / 255 * lit; cg[i] = 115 / 255 * lit; cb[i] = 150 / 255 * lit; }
+    }
+  }
+}
+
+// ---- from letters to pixels ----------------------------------------------------------------
+const GLYPH = Array.from({ length: 128 }, (_, i) => String.fromCharCode(i));
+let SKY;
+function makeSky() {
+  SKY = ctx.createLinearGradient(0, 0, 0, cv.height);
+  SKY.addColorStop(0, '#0a3150'); SKY.addColorStop(0.45, '#041628'); SKY.addColorStop(1, '#010509');
+}
+function paint() {
+  gx.clearRect(0, 0, W, H);
+  let shown = 0;
+  for (let r = 0; r < ROWS; r++) {
+    const y = r * CH;
+    for (let c = 0; c < COLS; c++) {
+      const i = r * COLS + c, ch = chars[i];
+      if (!ch) continue;
+      gx.fillStyle = `rgb(${Math.min(255, cr[i] * 255 | 0)},${Math.min(255, cg[i] * 255 | 0)},${Math.min(255, cb[i] * 255 | 0)})`;
+      gx.fillText(GLYPH[ch], c * CW, y);
+      shown++;
+    }
+  }
+  s1.clearRect(0, 0, S1.width, S1.height); s1.drawImage(G, 0, 0, S1.width, S1.height);
+  s2.clearRect(0, 0, S2.width, S2.height); s2.drawImage(S1, 0, 0, S2.width, S2.height);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+  ctx.fillStyle = SKY; ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = 'high';
+  ctx.globalAlpha = 0.45; ctx.drawImage(S2, 0, 0, cv.width, cv.height);
+  ctx.globalAlpha = 0.55; ctx.drawImage(S1, 0, 0, cv.width, cv.height);
+  ctx.globalAlpha = 1; ctx.drawImage(G, 0, 0);
+  return shown;
+}
+
+// ---- the sea -------------------------------------------------------------------------------
+let sharks = [], school = null;
+function populate() {
+  sharks = [new Shark({ size: 1, zMin: -0.4, zMax: 0.8, pal: PALETTES[0], hunter: true })];
+  const far = W / H > 1.3 ? 2 : 1;
+  for (let i = 0; i < far; i++) sharks.push(new Shark({ size: rnd(0.5, 0.65), zMin: 5, zMax: 9, pal: PALETTES[1 + (i % 2)], hunter: false }));
+  school = new School(Math.round(clamp(W * H / 22000, 40, 90)));
+  for (let i = 0; i < 240; i++) { for (const S of sharks) S.step(STEP, i * STEP - 4, school); school.step(STEP, sharks); }
+}
+
+document.getElementById('tag').textContent = location.hostname || '';
+if (location.hostname) document.title = location.hostname;
+
+let simT = 0, acc = 0, last = performance.now(), lastDraw = 0, ready = false;
+window.__sea = { fps: 0, ms: 0, chars: 0, all: () => sharks, feed: () => maybeFeed(0, sharks[0], school, true), feeds: () => feedsToday().length, peek: () => ({ BX, VY, SCALE, cam: cam.target, sharks: sharks.map(S => ({ kill: S.kill && { t: +S.kill.t.toFixed(1) }, jaw: +S.jaw.toFixed(2), close: S.close, nextClose: S.nextClose, lens: camDepth(S.pos), pos: S.pos, target: S.target, v: S.v, hunt: S.hunt, away: S.away, nextExit: S.nextExit, gone: S.gone })), school: school && { centre: school.centre, dead: school.n - school.alive.reduce((x, y) => x + y, 0), prey: school.prey }, bits: bits.length, nextFeedInMin: Math.round((nextFeed - Date.now()) / 6e4) }) };
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (window.innerWidth < 2 || window.innerHeight < 2) return;
+  if (!ready) { layout(); makeSky(); makeSnow(); populate(); ready = true; last = now; }
+  else if (window.innerWidth !== W || window.innerHeight !== H) { layout(); makeSky(); }
+  if (now - lastDraw < 1000 / FPS_CAP - 3) return;
+  const dt = Math.min((now - last) / 1000, 0.1);
+  last = now; lastDraw = now;
+  const t0 = performance.now();
+  acc += dt;
+  while (acc >= STEP) { for (const S of sharks) S.step(STEP, simT, school); school.step(STEP, sharks); stepBits(STEP); simT += STEP; acc -= STEP; }
+  maybeFeed(dt, sharks[0], school, false);
+  updateCamera(simT, dt, sharks[0]);
+  N = 0;
+  for (const S of sharks) gatherShark(S, simT);
+  gatherSchool(school, simT);
+  gatherBits();
+  gatherSnow(simT, dt);
+  project(); outline(); sunlight(simT);
+  const shown = paint();
+  const ms = performance.now() - t0;
+  window.__sea.ms = window.__sea.ms * 0.9 + ms * 0.1; window.__sea.chars = shown; window.__sea.fps = 1 / Math.max(dt, 1e-3);
+}
+requestAnimationFrame(frame);
+
+let idleTimer = 0;
+const wake = () => { document.body.classList.remove('idle'); clearTimeout(idleTimer); idleTimer = setTimeout(() => document.body.classList.add('idle'), 2500); };
+window.addEventListener('mousemove', wake); wake();
+window.addEventListener('dblclick', () => { if (!document.fullscreenElement) document.documentElement.requestFullscreen?.().catch(() => {}); else document.exitFullscreen?.(); });
+})();
+</script>
+</body>
+</html>
